@@ -1,8 +1,8 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: MIT
 pragma solidity 0.8.19;
 
-import {AccessControl} from "openzeppelin/access/AccessControl.sol";
-import {Pausable} from "openzeppelin/security/Pausable.sol";
+import {AccessControl} from "openzeppelin-contracts/contracts/access/AccessControl.sol";
+import {Pausable} from "openzeppelin-contracts/contracts/security/Pausable.sol";
 import {IPyth} from "pyth-sdk-solidity/IPyth.sol";
 import {PythStructs} from "pyth-sdk-solidity/PythStructs.sol";
 
@@ -28,6 +28,7 @@ contract CochilliGameBetaETH is AccessControl, Pausable {
     uint256 public nextBetId;
     uint256 public minBet = 1e15;
     uint256 public maxBet = 100e15;
+    uint256 public maxUtilizedLiquidity = 510e15;
     uint16 public minInterval = 1 minutes;
     uint16 public maxInterval = 10 minutes;
     uint16 public cancelBuffer = 5 minutes;
@@ -36,7 +37,6 @@ contract CochilliGameBetaETH is AccessControl, Pausable {
     mapping(uint256 => BetDetails) public betIds;
     mapping(address => uint256[]) public userBetIds;
     mapping(bytes8 => bytes32) public pairIds;
-    mapping(address => uint256) public balances;
 
     event BetPlaced(
         uint256 indexed betId,
@@ -59,7 +59,7 @@ contract CochilliGameBetaETH is AccessControl, Pausable {
     event Deposit(address indexed user, uint256 amount);
     event Withdrawal(address indexed user, uint256 amount);
     event UpdatedLeverage(uint16 leverage);
-    event UpdatedAmounts(uint256 minAmount, uint256 maxAmount);
+    event UpdatedAmounts(uint256 minAmount, uint256 maxAmount, uint256 maxUtilizedLiquidity);
     event UpdatedIntervals(uint16 minInterval, uint16 maxInterval);
     event PairsAdded(bytes8[] pairs, bytes32[] ids);
     event PairsDeleted(bytes8[] pairs);
@@ -216,16 +216,13 @@ contract CochilliGameBetaETH is AccessControl, Pausable {
     }
 
     function deposit() external payable whenNotPaused onlyRole(LP_ROLE) {
-        balances[msg.sender] += msg.value;
-
         emit Deposit(msg.sender, msg.value);
     }
 
     function withdraw(uint256 amount) external onlyRole(LP_ROLE) {
-        if (amount > balances[msg.sender]) revert InsufficientBalance();
-        if (amount > availableLiquidity()) revert InsufficientLiquidity();
+        uint256 unlockedLiquidity = address(this).balance - lockedLiquidity;
+        if (amount > unlockedLiquidity) revert InsufficientLiquidity();
 
-        balances[msg.sender] -= amount;
         (bool success, ) = msg.sender.call{value: amount}("");
         if (!success) revert WithdrawalFailed();
 
@@ -233,7 +230,7 @@ contract CochilliGameBetaETH is AccessControl, Pausable {
     }
 
     function availableLiquidity() public view returns (uint256) {
-        return address(this).balance - lockedLiquidity;
+        return maxUtilizedLiquidity - lockedLiquidity;
     }
 
     function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
@@ -244,12 +241,12 @@ contract CochilliGameBetaETH is AccessControl, Pausable {
         _unpause();
     }
 
-    function setAmounts(uint256 _minAmount, uint256 _maxAmount) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function setAmounts(uint256 _minAmount, uint256 _maxAmount, uint256 _maxUtilzedAmount) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (_minAmount == 0 || _maxAmount == 0 || _minAmount >= _maxAmount) revert InvalidAmount();
         minBet = _minAmount;
         maxBet = _maxAmount;
 
-        emit UpdatedAmounts(_minAmount, _maxAmount);
+        emit UpdatedAmounts(_minAmount, _maxAmount, _maxUtilzedAmount);
     }
 
     function setIntervals(uint16 _minInterval, uint16 _maxInterval) external onlyRole(DEFAULT_ADMIN_ROLE) {

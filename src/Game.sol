@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.19;
 
-import {IERC20} from "openzeppelin/token/ERC20/IERC20.sol";
-import {AccessControl} from "openzeppelin/access/AccessControl.sol";
-import {Pausable} from "openzeppelin/security/Pausable.sol";
+import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import {AccessControl} from "openzeppelin-contracts/contracts/access/AccessControl.sol";
+import {Pausable} from "openzeppelin-contracts/contracts/security/Pausable.sol";
 import {IPyth} from "pyth-sdk-solidity/IPyth.sol";
 import {PythStructs} from "pyth-sdk-solidity/PythStructs.sol";
 
@@ -28,8 +28,9 @@ contract CochilliGameBeta is AccessControl, Pausable {
 
     uint256 public lockedLiquidity;
     uint256 public nextBetId;
-    uint256 public minBet = 1e18;
-    uint256 public maxBet = 1800e18;
+    uint256 public minBet = 15e6;
+    uint256 public maxBet = 250e6;
+    uint256 public maxUtilizedLiquidity = 850e6;
     uint16 public minInterval = 1 minutes;
     uint16 public maxInterval = 10 minutes;
     uint16 public cancelBuffer = 5 minutes;
@@ -38,7 +39,6 @@ contract CochilliGameBeta is AccessControl, Pausable {
     mapping(uint256 => BetDetails) public betIds;
     mapping(address => uint256[]) public userBetIds;
     mapping(bytes8 => bytes32) public pairIds;
-    mapping(address => uint256) public balances;
 
     event BetPlaced(
         uint256 indexed betId,
@@ -61,7 +61,7 @@ contract CochilliGameBeta is AccessControl, Pausable {
     event Deposit(address indexed user, uint256 amount);
     event Withdrawal(address indexed user, uint256 amount);
     event UpdatedLeverage(uint16 leverage);
-    event UpdatedAmounts(uint256 minAmount, uint256 maxAmount);
+    event UpdatedAmounts(uint256 minAmount, uint256 maxAmount, uint256 maxUtilizedLiquidity);
     event UpdatedIntervals(uint16 minInterval, uint16 maxInterval);
     event PairsAdded(bytes8[] pairs, bytes32[] ids);
     event PairsDeleted(bytes8[] pairs);
@@ -72,6 +72,7 @@ contract CochilliGameBeta is AccessControl, Pausable {
     error InvalidPair(bytes8 pair);
     error DuplicatePair(bytes8 pair);
     error InvalidPrice();
+    error InvalidFee();
     error InsufficientLiquidity();
     error InsufficientBalance();
     error InactiveBet();
@@ -82,7 +83,7 @@ contract CochilliGameBeta is AccessControl, Pausable {
     error DepositFailed();
     error WithdrawalFailed();
 
-    constructor(address _tokenAddress, address _pyth) payable {
+    constructor(address _tokenAddress, address _pyth) {
         token = IERC20(_tokenAddress);
         pyth = IPyth(_pyth);
 
@@ -140,23 +141,25 @@ contract CochilliGameBeta is AccessControl, Pausable {
         uint256 betId,
         bytes calldata openPriceVaa,
         bytes calldata closePriceVaa
-    ) external whenNotPaused {
+    ) external payable whenNotPaused {
         BetDetails memory closeBetDetails = betIds[betId];
 
         if (closeBetDetails.endTime >= block.timestamp) revert UnelapsedBet();
         if (!closeBetDetails.active) revert InactiveBet();
 
         bytes32 pairId = pairIds[closeBetDetails.pair];
-        int64 openPrice = getPrice(
+        (int64 openPrice, uint256 openFee) = getPrice(
             pairId,
             openPriceVaa,
             closeBetDetails.startTime
         );
-        int64 closePrice = getPrice(
+        (int64 closePrice, uint256 closeFee) = getPrice(
             pairId,
             closePriceVaa,
             closeBetDetails.endTime
         );
+
+        if (openFee + closeFee != msg.value) revert InvalidFee();
 
         betIds[betId].active = false;
         betIds[betId].openPrice = openPrice;
@@ -201,7 +204,7 @@ contract CochilliGameBeta is AccessControl, Pausable {
         bytes32 pairId,
         bytes memory priceData,
         uint64 timestamp
-    ) internal returns (int64) {
+    ) internal returns (int64, uint256) {
         bytes32[] memory pythPair = new bytes32[](1);
         bytes[] memory pythData = new bytes[](1);
         pythPair[0] = pairId;
@@ -217,22 +220,20 @@ contract CochilliGameBeta is AccessControl, Pausable {
         )[0];
 
         if (pythPrice.id != pairId) revert InvalidPrice();
-        return pythPrice.price.price;
+        return (pythPrice.price.price, fee);
     }
 
     function deposit(uint256 amount) external whenNotPaused onlyRole(LP_ROLE) {
-        bool status = token.transferFrom(msg.sender, address(this), amount);
-        if (!status) revert DepositFailed();
-        balances[msg.sender] += amount;
+        bool success = token.transferFrom(msg.sender, address(this), amount);
+        if (!success) revert DepositFailed();
 
         emit Deposit(msg.sender, amount);
     }
 
     function withdraw(uint256 amount) external onlyRole(LP_ROLE) {
-        if (balances[msg.sender] < amount) revert InsufficientBalance();
-        if (amount > availableLiquidity()) revert InsufficientLiquidity();
+        uint256 unlockedLiquidity = token.balanceOf(address(this)) - lockedLiquidity;
+        if (amount > unlockedLiquidity) revert InsufficientLiquidity();
 
-        balances[msg.sender] -= amount;
         bool success = token.transfer(msg.sender, amount);
         if (!success) revert WithdrawalFailed();
 
@@ -240,7 +241,7 @@ contract CochilliGameBeta is AccessControl, Pausable {
     }
 
     function availableLiquidity() public view returns (uint256) {
-        return token.balanceOf(address(this)) - lockedLiquidity;
+        return maxUtilizedLiquidity - lockedLiquidity;
     }
 
     function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
@@ -251,12 +252,13 @@ contract CochilliGameBeta is AccessControl, Pausable {
         _unpause();
     }
 
-    function setAmounts(uint256 _minAmount, uint256 _maxAmount) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function setAmounts(uint256 _minAmount, uint256 _maxAmount, uint256 _maxUtilzedAmount) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (_minAmount == 0 || _maxAmount == 0 || _minAmount >= _maxAmount) revert InvalidAmount();
+        maxUtilizedLiquidity = _maxUtilzedAmount;
         minBet = _minAmount;
         maxBet = _maxAmount;
 
-        emit UpdatedAmounts(_minAmount, _maxAmount);
+        emit UpdatedAmounts(_minAmount, _maxAmount, _maxUtilzedAmount);
     }
 
     function setIntervals(uint16 _minInterval, uint16 _maxInterval) external onlyRole(DEFAULT_ADMIN_ROLE) {
